@@ -1,296 +1,269 @@
 import os
 import random
 import subprocess
+import tempfile
+from pathlib import Path
 import logging
-import json
-import time
 
 logger = logging.getLogger(__name__)
 
-def has_rubberband():
-    """Check if FFmpeg has rubberband filter available"""
-    try:
-        result = subprocess.run(
-            ['ffmpeg', '-filters'],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return 'rubberband' in result.stdout
-    except Exception as e:
-        logger.warning(f"Could not check for rubberband: {e}")
-        return False
-
 def get_video_info(input_path):
-    """Get basic video information safely"""
+    """Get video information using ffprobe."""
     try:
         cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-show_streams', input_path
+            'ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', str(input_path)
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            import json
+            data = json.loads(result.stdout)
+            video_stream = next((s for s in data['streams'] if s['codec_type'] == 'video'), None)
+            audio_stream = next((s for s in data['streams'] if s['codec_type'] == 'audio'), None)
+            
+            duration = float(data['format'].get('duration', 0))
+            width = int(video_stream.get('width', 1920)) if video_stream else 1920
+            height = int(video_stream.get('height', 1080)) if video_stream else 1080
+            
+            return {
+                'duration': duration,
+                'width': width,
+                'height': height,
+                'has_audio': audio_stream is not None
+            }
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+    
+    return {'duration': 30, 'width': 1920, 'height': 1080, 'has_audio': True}
+
+def create_invisible_watermark(width, height, position="topleft"):
+    """Create an invisible watermark filter."""
+    positions = {
+        'topleft': (10, 10),
+        'topright': (width - 60, 10),
+        'bottomleft': (10, height - 30),
+        'bottomright': (width - 60, height - 30),
+        'center': (width // 2 - 25, height // 2 - 10)
+    }
+    
+    x, y = positions.get(position, (10, 10))
+    
+    # Create invisible text with very low opacity
+    return f"drawtext=text='ID{random.randint(1000,9999)}':x={x}:y={y}:fontsize=12:fontcolor=white@0.01"
+
+def process_video_comprehensive_stable(input_path, output_path):
+    """Process video with maximum modifications while maintaining stability."""
+    try:
+        # Get video info
+        info = get_video_info(input_path)
+        duration = info['duration']
+        width = info['width']
+        height = info['height']
+        has_audio = info['has_audio']
+        
+        # Determine processing level based on video length
+        is_long_video = duration > 180  # 3 minutes
+        
+        logger.info(f"Processing video: {duration:.1f}s, {width}x{height}, audio: {has_audio}")
+        
+        # Build command with proper string conversion
+        cmd = ['ffmpeg', '-y', '-i', str(input_path)]
+        
+        # Video filters - all values converted to strings
+        video_filters = []
+        
+        # 1. Geometric transformations (subtle for stability)
+        crop_x = random.randint(2, 4)
+        crop_y = random.randint(2, 4)
+        video_filters.append(f"crop=iw-{crop_x}:ih-{crop_y}:{crop_x//2}:{crop_y//2}")
+        
+        pad_x = random.randint(1, 2)
+        pad_y = random.randint(1, 2)
+        video_filters.append(f"pad=iw+{pad_x}:ih+{pad_y}:{pad_x//2}:{pad_y//2}:black")
+        
+        # Rotation (very subtle)
+        rotation = random.uniform(-1.0, 1.0)
+        video_filters.append(f"rotate={rotation}*PI/180:fillcolor=black")
+        
+        # 2. Color modifications
+        brightness = random.uniform(-0.05, 0.05)
+        contrast = random.uniform(0.95, 1.05)
+        saturation = random.uniform(0.9, 1.1)
+        gamma = random.uniform(0.9, 1.1)
+        hue_shift = random.uniform(-5, 5)
+        
+        video_filters.append(f"eq=brightness={brightness:.3f}:contrast={contrast:.3f}:saturation={saturation:.3f}:gamma={gamma:.3f}")
+        video_filters.append(f"hue=h={hue_shift:.1f}")
+        
+        # 3. Individual RGB gamma (advanced color modification)
+        gamma_r = random.uniform(0.95, 1.05)
+        gamma_g = random.uniform(0.95, 1.05)
+        gamma_b = random.uniform(0.95, 1.05)
+        video_filters.append(f"eq=gamma_r={gamma_r:.3f}:gamma_g={gamma_g:.3f}:gamma_b={gamma_b:.3f}")
+        
+        # 4. Noise and sharpening
+        noise_strength = random.randint(3, 8) if not is_long_video else random.randint(2, 5)
+        video_filters.append(f"noise=alls={noise_strength}:allf=t")
+        
+        sharpen_amount = random.uniform(0.1, 0.2)
+        video_filters.append(f"unsharp=5:5:{sharpen_amount:.2f}")
+        
+        # 5. Invisible watermarks (5 different positions)
+        watermark_positions = ['topleft', 'topright', 'bottomleft', 'bottomright', 'center']
+        for pos in watermark_positions:
+            video_filters.append(create_invisible_watermark(width, height, pos))
+        
+        # 6. Timestamp watermark (invisible)
+        import time
+        timestamp = int(time.time())
+        video_filters.append(f"drawtext=text='T{timestamp}':x=5:y=5:fontsize=8:fontcolor=white@0.005")
+        
+        # Apply video filters
+        cmd.extend(['-vf', ','.join(video_filters)])
+        
+        # Audio processing (if audio exists)
+        if has_audio:
+            audio_filters = []
+            
+            # Tempo and pitch modifications
+            tempo_change = random.uniform(0.98, 1.02)
+            pitch_shift = random.uniform(-20, 20)  # cents
+            
+            audio_filters.append(f"atempo={tempo_change:.4f}")
+            if abs(pitch_shift) > 5:  # Only apply if significant
+                audio_filters.append(f"asetrate=44100*{1 + pitch_shift/1200:.6f},aresample=44100")
+            
+            # Volume adjustment
+            volume_db = random.uniform(-0.5, 0.5)
+            audio_filters.append(f"volume={volume_db:.2f}dB")
+            
+            # Multi-band EQ
+            eq_200 = random.uniform(-0.8, 0.8)
+            eq_1k = random.uniform(-0.3, 0.3)
+            eq_5k = random.uniform(-0.8, 0.8)
+            eq_10k = random.uniform(-0.3, 0.3)
+            
+            audio_filters.append(f"equalizer=f=200:t=o:w=100:g={eq_200:.1f}")
+            audio_filters.append(f"equalizer=f=1000:t=o:w=100:g={eq_1k:.1f}")
+            audio_filters.append(f"equalizer=f=5000:t=o:w=100:g={eq_5k:.1f}")
+            audio_filters.append(f"equalizer=f=10000:t=o:w=100:g={eq_10k:.1f}")
+            
+            # High/low pass filters (subtle)
+            audio_filters.append("highpass=f=20")
+            audio_filters.append("lowpass=f=18000")
+            
+            cmd.extend(['-af', ','.join(audio_filters)])
+            
+            # Audio codec settings
+            audio_bitrate = random.choice(['96k', '128k', '160k', '192k'])
+            cmd.extend(['-c:a', 'aac', '-b:a', audio_bitrate])
+        else:
+            cmd.extend(['-an'])  # No audio
+        
+        # Video encoding settings (extensive variations)
+        crf = str(random.randint(20, 25))
+        preset = random.choice(['fast', 'medium', 'slow'])
+        profile = random.choice(['baseline', 'main', 'high'])
+        pixel_format = random.choice(['yuv420p', 'yuv422p'])
+        
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-crf', crf,
+            '-preset', preset,
+            '-profile:v', profile,
+            '-pix_fmt', pixel_format
+        ])
+        
+        # GOP and frame settings
+        gop_size = str(random.randint(15, 60))
+        b_frames = str(random.randint(1, 3))
+        ref_frames = str(random.randint(2, 4))
+        
+        cmd.extend([
+            '-g', gop_size,
+            '-bf', b_frames,
+            '-refs', ref_frames
+        ])
+        
+        # Frame rate modification
+        fps_options = ['23.976', '24', '25', '29.97', '30']
+        target_fps = random.choice(fps_options)
+        cmd.extend(['-r', target_fps])
+        
+        # Color space and range
+        colorspace = random.choice(['bt709', 'bt470bg', 'smpte170m'])
+        cmd.extend([
+            '-colorspace', colorspace,
+            '-color_range', 'tv'
+        ])
+        
+        # Metadata removal and addition
+        cmd.extend([
+            '-map_metadata', '-1',
+            '-metadata', f'title=Processed_{random.randint(1000, 9999)}',
+            '-metadata', f'comment=Optimized_{random.randint(100, 999)}',
+            '-metadata', f'description=Enhanced_Video_{timestamp}',
+            '-metadata', f'encoder=CustomProcessor_v{random.randint(1, 5)}.{random.randint(0, 9)}'
+        ])
+        
+        # Output file
+        cmd.append(str(output_path))
+        
+        # Convert all arguments to strings to prevent type errors
+        cmd = [str(arg) for arg in cmd]
+        
+        # Log command for debugging (truncated)
+        logger.info(f"FFmpeg command length: {len(cmd)} arguments")
+        logger.info(f"Processing settings: CRF={crf}, Preset={preset}, FPS={target_fps}")
+        
+        # Execute command with timeout
+        timeout = 600 if is_long_video else 300  # 10 min for long videos, 5 min for short
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=tempfile.gettempdir()
+        )
         
         if result.returncode != 0:
-            logger.warning(f"ffprobe failed: {result.stderr}")
-            return None
-            
-        data = json.loads(result.stdout)
+            logger.error(f"FFmpeg failed with return code {result.returncode}")
+            logger.error(f"FFmpeg stderr: {result.stderr}")
+            raise Exception(f"FFmpeg processing failed: {result.stderr}")
         
-        # Find video stream
-        video_stream = None
-        for stream in data.get('streams', []):
-            if stream.get('codec_type') == 'video':
-                video_stream = stream
-                break
+        logger.info("Video processing completed successfully")
+        return True
         
-        if not video_stream:
-            return None
-            
-        return {
-            'duration': float(data.get('format', {}).get('duration', 0)),
-            'width': int(video_stream.get('width', 0)),
-            'height': int(video_stream.get('height', 0)),
-            'fps': eval(video_stream.get('r_frame_rate', '25/1')),
-            'codec': video_stream.get('codec_name', 'unknown')
-        }
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg processing timed out")
+        raise Exception("Video processing timed out")
     except Exception as e:
-        logger.warning(f"Could not get video info: {e}")
-        return None
+        logger.error(f"Video processing error: {str(e)}")
+        raise Exception(f"Processing failed: {str(e)}")
 
-def build_ffmpeg_command(input_path, output_path):
-    """Build FFmpeg command with MAXIMUM modifications but stable execution"""
-    
-    # Get video info for optimization
-    video_info = get_video_info(input_path)
-    
-    # Use conservative settings if we can't get video info
-    if video_info is None:
-        logger.warning("Using fallback settings - no video info available")
-        video_info = {'duration': 60, 'width': 1920, 'height': 1080, 'fps': 30}
-    
-    # For very long videos, use simpler processing to prevent crashes
-    is_long_video = video_info['duration'] > 180  # 3 minutes
-    if is_long_video:
-        logger.info(f"Long video detected ({video_info['duration']}s) - using optimized settings")
-    
-    # ENCODING PARAMETERS (varied but stable)
-    crf = random.choice([18, 19, 20, 21, 22, 23, 24, 25])  # Wide quality range
-    gop = random.choice([12, 24, 48, 60]) if not is_long_video else random.choice([24, 48])
-    preset = random.choice(['fast', 'medium', 'slow']) if not is_long_video else 'fast'
-    profile = random.choice(['baseline', 'main', 'high'])
-    
-    # MAXIMUM VISUAL MODIFICATIONS (but stable)
-    # Geometric transformations
-    crop_pixels = random.randint(2, 6)  # Significant cropping
-    pad_pixels = crop_pixels + random.randint(1, 3)
-    rotation = round(random.uniform(-1.5, 1.5), 2)  # ±1.5 degrees
-    
-    # Color adjustments - MAXIMUM but stable ranges
-    brightness = round(random.uniform(-0.08, 0.08), 3)     # ±8%
-    contrast = round(random.uniform(0.92, 1.08), 3)        # ±8%
-    saturation = round(random.uniform(0.85, 1.15), 3)      # ±15%
-    gamma = round(random.uniform(0.85, 1.15), 3)           # ±15%
-    gamma_r = round(random.uniform(0.95, 1.05), 3)         # Red gamma
-    gamma_g = round(random.uniform(0.95, 1.05), 3)         # Green gamma
-    gamma_b = round(random.uniform(0.95, 1.05), 3)         # Blue gamma
-    hue_shift = round(random.uniform(-8, 8), 1)             # ±8 degrees
-    
-    # Advanced color grading
-    shadows = round(random.uniform(0.9, 1.1), 3)
-    midtones = round(random.uniform(0.95, 1.05), 3)
-    highlights = round(random.uniform(0.9, 1.1), 3)
-    
-    # Noise and texture
-    noise_level = random.randint(8, 15) if not is_long_video else random.randint(5, 10)
-    sharpen_amount = round(random.uniform(0.1, 0.3), 2)
-    blur_amount = round(random.uniform(0.1, 0.5), 2)
-    
-    # Frame rate variations
-    fps_options = [23.976, 24, 25, 29.97, 30]
-    target_fps = random.choice(fps_options)
-    
-    # MAXIMUM AUDIO MODIFICATIONS
-    tempo_variation = round(random.uniform(0.97, 1.03), 3)  # ±3%
-    pitch_shift = round(random.uniform(0.995, 1.005), 4)    # Subtle pitch
-    volume_change = round(random.uniform(0.9, 1.1), 3)      # ±10%
-    
-    # EQ settings for multiple bands
-    eq_200 = round(random.uniform(-1, 1), 1)    # Bass
-    eq_1000 = round(random.uniform(-0.5, 0.5), 1)  # Mid
-    eq_5000 = round(random.uniform(-1, 1), 1)   # High mid
-    eq_10000 = round(random.uniform(-0.5, 0.5), 1) # Treble
-    
-    # Build COMPREHENSIVE audio filter chain
-    audio_filters = []
-    
-    # Tempo and pitch (try rubberband first)
-    if has_rubberband() and not is_long_video:
-        audio_filters.append(f"rubberband=tempo={tempo_variation}:pitch={pitch_shift}")
-        pitch_preserved = True
-    else:
-        audio_filters.append(f"atempo={tempo_variation}")
-        if abs(pitch_shift - 1.0) > 0.001:  # Only add if significant
-            audio_filters.append(f"asetrate=44100*{pitch_shift},aresample=44100")
-        pitch_preserved = False
-    
-    # Multi-band EQ
-    audio_filters.extend([
-        f"equalizer=f=200:t=q:w=1:g={eq_200}",
-        f"equalizer=f=1000:t=q:w=1:g={eq_1000}",
-        f"equalizer=f=5000:t=q:w=1:g={eq_5000}",
-        f"equalizer=f=10000:t=q:w=1:g={eq_10000}"
-    ])
-    
-    # Volume and effects
-    audio_filters.extend([
-        f"volume={volume_change}",
-        f"dcshift={round(random.uniform(-0.01, 0.01), 3)}",
-        "highpass=f=20",  # Remove very low frequencies
-        "lowpass=f=20000"  # Remove very high frequencies
-    ])
-    
-    # Build MAXIMUM video filter chain
-    video_filters = []
-    
-    # Geometric transformations (applied in order)
-    video_filters.extend([
-        f"crop=iw-{crop_pixels*2}:ih-{crop_pixels*2}:{crop_pixels}:{crop_pixels}",
-        f"pad=iw+{pad_pixels*2}:ih+{pad_pixels*2}:{pad_pixels}:{pad_pixels}:color=black",
-        f"rotate={rotation}*PI/180:fillcolor=black:bilinear=0"
-    ])
-    
-    # Color corrections (major modifications)
-    video_filters.extend([
-        f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma}:gamma_r={gamma_r}:gamma_g={gamma_g}:gamma_b={gamma_b}",
-        f"hue=h={hue_shift}:s={round(random.uniform(0.9, 1.1), 2)}",
-        f"curves=r='0/0 0.5/{midtones} 1/1':g='0/0 0.5/{midtones} 1/1':b='0/0 0.5/{midtones} 1/1'"
-    ])
-    
-    # Texture and noise modifications
-    if not is_long_video:
-        video_filters.extend([
-            f"noise=alls={noise_level}:allf=t+u",
-            f"unsharp=5:5:{sharpen_amount}:5:5:0.0",
-            f"boxblur={blur_amount}:1"
-        ])
-    else:
-        # Simpler for long videos
-        video_filters.append(f"noise=alls={noise_level//2}:allf=t")
-    
-    # Frame rate conversion
-    if abs(target_fps - video_info.get('fps', 30)) > 0.1:
-        video_filters.append(f"fps={target_fps}")
-    
-    # Multiple invisible watermarks (hash-changing)
-    timestamp = int(time.time())
-    video_filters.extend([
-        f"drawbox=x=0:y=0:w=1:h=1:color=white@0.004:t=fill",  # TL
-        f"drawbox=x=iw-1:y=0:w=1:h=1:color=red@0.003:t=fill",  # TR
-        f"drawbox=x=0:y=ih-1:w=1:h=1:color=blue@0.005:t=fill", # BL
-        f"drawbox=x=iw-1:y=ih-1:w=1:h=1:color=green@0.002:t=fill", # BR
-        f"drawbox=x=iw/2:y=ih/2:w=1:h=1:color=yellow@0.001:t=fill", # Center
-    ])
-    
-    # Invisible text watermark (changes hash significantly)
-    video_filters.append(f"drawtext=text='{timestamp}':x=10:y=10:fontsize=1:fontcolor=white@0.001")
-    
-    # Join all filters
-    vfilter = ",".join(video_filters)
-    afilter = ",".join(audio_filters)
-    
-    # Build final command with MAXIMUM modifications but stability focus
-    cmd = [
-        "ffmpeg",
-        "-y",  # Overwrite output
-        "-i", input_path,
+def process_video_simple_fallback(input_path, output_path):
+    """Simple fallback processing for problematic videos."""
+    try:
+        cmd = [
+            'ffmpeg', '-y', '-i', str(input_path),
+            '-vf', 'scale=iw-2:ih-2,eq=brightness=0.02:contrast=1.02',
+            '-c:v', 'libx264', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-preset', 'fast',
+            '-map_metadata', '-1',
+            str(output_path)
+        ]
         
-        # Input options for stability
-        "-avoid_negative_ts", "make_zero",
-        "-fflags", "+genpts",
-        "-thread_queue_size", "512",
+        # Convert all to strings
+        cmd = [str(arg) for arg in cmd]
         
-        # Video encoding with variations
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-profile:v", profile,
-        "-crf", str(crf),
-        "-g", str(gop),
-        "-keyint_min", str(gop // 4),
-        "-sc_threshold", "0",
-        "-bf", str(random.choice([0, 1, 2, 3])),  # B-frames
-        "-refs", str(random.choice([1, 2, 3, 4])),  # Reference frames
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         
-        # Video filters (MAXIMUM modifications)
-        "-vf", vfilter,
+        if result.returncode != 0:
+            raise Exception(f"Simple processing failed: {result.stderr}")
         
-        # Audio encoding variations
-        "-c:a", "aac",
-        "-b:a", random.choice(["96k", "128k", "160k", "192k"]),
-        "-ar", random.choice([44100, 48000]),
-        "-ac", "2",
+        return True
         
-        # Audio filters (MAXIMUM modifications)
-        "-af", afilter,
-        
-        # Format options with variations
-        "-f", "mp4",
-        "-movflags", "+faststart+write_colr",
-        
-        # Color space variations (major hash changes)
-        "-colorspace", random.choice(["bt709", "bt470bg", "smpte170m"]),
-        "-color_primaries", random.choice(["bt709", "bt470bg", "smpte170m"]),
-        "-color_trc", random.choice(["bt709", "gamma22", "smpte170m"]),
-        
-        # Pixel format variations
-        "-pix_fmt", random.choice(["yuv420p", "yuv422p", "yuv444p"]),
-        
-        # Remove ALL metadata (complete anonymization)
-        "-map_metadata", "-1",
-        "-map_chapters", "-1",
-        "-fflags", "+bitexact",
-        
-        # Add custom metadata (randomized)
-        "-metadata", f"title=Processed_{timestamp}",
-        "-metadata", f"comment=Hash_{random.randint(10000, 99999)}",
-        "-metadata", f"description=Modified_{random.choice(['A', 'B', 'C', 'D'])}",
-        "-metadata", f"encoder=Custom_{random.choice(['X', 'Y', 'Z'])}",
-        
-        # Stability options
-        "-max_muxing_queue_size", "1024",
-        "-avoid_negative_ts", "make_zero",
-        "-err_detect", "ignore_err",  # Ignore minor errors
-        
-        output_path
-    ]
-    
-    # Log comprehensive info
-    logger.info(f"MAXIMUM FFmpeg command built:")
-    logger.info(f"  Video: CRF={crf}, GOP={gop}, Preset={preset}, Profile={profile}")
-    logger.info(f"  Filters: {len(video_filters)} video filters, {len(audio_filters)} audio filters")
-    logger.info(f"  Color: Brightness={brightness}, Contrast={contrast}, Saturation={saturation}")
-    logger.info(f"  Audio: Tempo={tempo_variation}, Volume={volume_change}, Pitch_preserved={pitch_preserved}")
-    logger.info(f"  Geometric: Crop={crop_pixels}px, Pad={pad_pixels}px, Rotation={rotation}°")
-    
-    return cmd, pitch_preserved
-
-def build_simple_command(input_path, output_path):
-    """Fallback simple command for problematic videos"""
-    logger.info("Using simple fallback command")
-    
-    # Minimal modifications for maximum stability
-    brightness = round(random.uniform(-0.01, 0.01), 3)
-    contrast = round(random.uniform(0.99, 1.01), 3)
-    tempo = round(random.uniform(0.99, 1.01), 3)
-    
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-vf", f"eq=brightness={brightness}:contrast={contrast},noise=alls=3:allf=t",
-        "-c:a", "aac", "-b:a", "128k",
-        "-af", f"atempo={tempo}",
-        "-map_metadata", "-1",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    
-    return cmd, False
+    except Exception as e:
+        logger.error(f"Simple fallback failed: {str(e)}")
+        raise
