@@ -60,8 +60,14 @@ def process_video_comprehensive_stable(input_path, output_path):
         height = info['height']
         has_audio = info['has_audio']
         
-        # Determine processing level based on video length
+        # Determine processing level based on video length and size
         is_long_video = duration > 180  # 3 minutes
+        is_large_video = width * height > 1920 * 1080  # Above 1080p
+        
+        # Use conservative settings for large/long videos
+        if is_long_video or is_large_video:
+            logger.info(f"Using conservative settings for large video: {duration:.1f}s, {width}x{height}")
+            return process_video_conservative(input_path, output_path, info)
         
         logger.info(f"Processing video: {duration:.1f}s, {width}x{height}, audio: {has_audio}")
         
@@ -100,15 +106,15 @@ def process_video_comprehensive_stable(input_path, output_path):
         gamma_b = random.uniform(0.95, 1.05)
         video_filters.append(f"eq=gamma_r={gamma_r:.3f}:gamma_g={gamma_g:.3f}:gamma_b={gamma_b:.3f}")
         
-        # 4. Noise and sharpening
-        noise_strength = random.randint(3, 8) if not is_long_video else random.randint(2, 5)
+        # 4. Noise and sharpening (reduced for memory efficiency)
+        noise_strength = random.randint(2, 5)
         video_filters.append(f"noise=alls={noise_strength}:allf=t")
         
         sharpen_amount = random.uniform(0.1, 0.2)
         video_filters.append(f"unsharp=5:5:{sharpen_amount:.2f}")
         
-        # 5. Invisible watermarks (5 different positions)
-        watermark_positions = ['topleft', 'topright', 'bottomleft', 'bottomright', 'center']
+        # 5. Reduced invisible watermarks (3 instead of 5 for memory)
+        watermark_positions = ['topleft', 'bottomright', 'center']
         for pos in watermark_positions:
             video_filters.append(create_invisible_watermark(width, height, pos))
         
@@ -125,27 +131,23 @@ def process_video_comprehensive_stable(input_path, output_path):
             audio_filters = []
             
             # Tempo and pitch modifications
-            tempo_change = random.uniform(0.98, 1.02)
-            pitch_shift = random.uniform(-20, 20)  # cents
+            tempo_change = random.uniform(0.99, 1.01)  # Reduced range
+            pitch_shift = random.uniform(-10, 10)  # Reduced range
             
             audio_filters.append(f"atempo={tempo_change:.4f}")
             if abs(pitch_shift) > 5:  # Only apply if significant
                 audio_filters.append(f"asetrate=44100*{1 + pitch_shift/1200:.6f},aresample=44100")
             
             # Volume adjustment
-            volume_db = random.uniform(-0.5, 0.5)
+            volume_db = random.uniform(-0.3, 0.3)
             audio_filters.append(f"volume={volume_db:.2f}dB")
             
-            # Multi-band EQ
-            eq_200 = random.uniform(-0.8, 0.8)
-            eq_1k = random.uniform(-0.3, 0.3)
-            eq_5k = random.uniform(-0.8, 0.8)
-            eq_10k = random.uniform(-0.3, 0.3)
+            # Reduced EQ (2 bands instead of 4)
+            eq_200 = random.uniform(-0.5, 0.5)
+            eq_5k = random.uniform(-0.5, 0.5)
             
             audio_filters.append(f"equalizer=f=200:t=o:w=100:g={eq_200:.1f}")
-            audio_filters.append(f"equalizer=f=1000:t=o:w=100:g={eq_1k:.1f}")
             audio_filters.append(f"equalizer=f=5000:t=o:w=100:g={eq_5k:.1f}")
-            audio_filters.append(f"equalizer=f=10000:t=o:w=100:g={eq_10k:.1f}")
             
             # High/low pass filters (subtle)
             audio_filters.append("highpass=f=20")
@@ -154,16 +156,16 @@ def process_video_comprehensive_stable(input_path, output_path):
             cmd.extend(['-af', ','.join(audio_filters)])
             
             # Audio codec settings
-            audio_bitrate = random.choice(['96k', '128k', '160k', '192k'])
+            audio_bitrate = random.choice(['128k', '160k'])
             cmd.extend(['-c:a', 'aac', '-b:a', audio_bitrate])
         else:
             cmd.extend(['-an'])  # No audio
         
         # Video encoding settings (extensive variations)
-        crf = str(random.randint(20, 25))
-        preset = random.choice(['fast', 'medium', 'slow'])
-        profile = random.choice(['baseline', 'main', 'high'])
-        pixel_format = random.choice(['yuv420p', 'yuv422p'])
+        crf = str(random.randint(22, 25))  # Higher CRF for smaller files
+        preset = random.choice(['fast', 'medium'])  # Faster presets
+        profile = random.choice(['main', 'high'])
+        pixel_format = 'yuv420p'  # Standard format
         
         cmd.extend([
             '-c:v', 'libx264',
@@ -174,9 +176,9 @@ def process_video_comprehensive_stable(input_path, output_path):
         ])
         
         # GOP and frame settings
-        gop_size = str(random.randint(15, 60))
-        b_frames = str(random.randint(1, 3))
-        ref_frames = str(random.randint(2, 4))
+        gop_size = str(random.randint(24, 48))
+        b_frames = str(random.randint(1, 2))
+        ref_frames = str(random.randint(2, 3))
         
         cmd.extend([
             '-g', gop_size,
@@ -190,7 +192,7 @@ def process_video_comprehensive_stable(input_path, output_path):
         cmd.extend(['-r', target_fps])
         
         # Color space and range
-        colorspace = random.choice(['bt709', 'bt470bg', 'smpte170m'])
+        colorspace = random.choice(['bt709', 'bt470bg'])
         cmd.extend([
             '-colorspace', colorspace,
             '-color_range', 'tv'
@@ -216,7 +218,7 @@ def process_video_comprehensive_stable(input_path, output_path):
         logger.info(f"Processing settings: CRF={crf}, Preset={preset}, FPS={target_fps}")
         
         # Execute command with timeout
-        timeout = 600 if is_long_video else 300  # 10 min for long videos, 5 min for short
+        timeout = 480 if is_long_video else 240  # 8 min for long videos, 4 min for short
         
         result = subprocess.run(
             cmd,
@@ -240,6 +242,95 @@ def process_video_comprehensive_stable(input_path, output_path):
     except Exception as e:
         logger.error(f"Video processing error: {str(e)}")
         raise Exception(f"Processing failed: {str(e)}")
+
+def process_video_conservative(input_path, output_path, info):
+    """Conservative processing for large/long videos."""
+    try:
+        logger.info("Using conservative processing mode")
+        
+        cmd = ['ffmpeg', '-y', '-i', str(input_path)]
+        
+        # Simple but effective filters
+        video_filters = []
+        
+        # Basic geometric changes
+        crop_x = random.randint(2, 3)
+        crop_y = random.randint(2, 3)
+        video_filters.append(f"crop=iw-{crop_x}:ih-{crop_y}:{crop_x//2}:{crop_y//2}")
+        
+        # Color adjustments
+        brightness = random.uniform(-0.03, 0.03)
+        contrast = random.uniform(0.97, 1.03)
+        saturation = random.uniform(0.95, 1.05)
+        
+        video_filters.append(f"eq=brightness={brightness:.3f}:contrast={contrast:.3f}:saturation={saturation:.3f}")
+        
+        # Light noise
+        noise_strength = random.randint(1, 3)
+        video_filters.append(f"noise=alls={noise_strength}:allf=t")
+        
+        # Single invisible watermark
+        video_filters.append(create_invisible_watermark(info['width'], info['height'], 'center'))
+        
+        cmd.extend(['-vf', ','.join(video_filters)])
+        
+        # Audio processing (simplified)
+        if info['has_audio']:
+            audio_filters = []
+            tempo_change = random.uniform(0.995, 1.005)
+            volume_db = random.uniform(-0.2, 0.2)
+            
+            audio_filters.append(f"atempo={tempo_change:.4f}")
+            audio_filters.append(f"volume={volume_db:.2f}dB")
+            
+            cmd.extend(['-af', ','.join(audio_filters)])
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+        else:
+            cmd.extend(['-an'])
+        
+        # Conservative encoding
+        crf = str(random.randint(23, 26))
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-crf', crf,
+            '-preset', 'fast',
+            '-profile:v', 'main',
+            '-pix_fmt', 'yuv420p',
+            '-g', '30',
+            '-bf', '1',
+            '-refs', '2'
+        ])
+        
+        # Metadata
+        import time
+        timestamp = int(time.time())
+        cmd.extend([
+            '-map_metadata', '-1',
+            '-metadata', f'title=Processed_{random.randint(1000, 9999)}',
+            '-metadata', f'encoder=SimpleProcessor_{timestamp}'
+        ])
+        
+        cmd.append(str(output_path))
+        cmd = [str(arg) for arg in cmd]
+        
+        # Shorter timeout for conservative processing
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minutes max
+            cwd=tempfile.gettempdir()
+        )
+        
+        if result.returncode != 0:
+            raise Exception(f"Conservative processing failed: {result.stderr}")
+        
+        logger.info("Conservative processing completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Conservative processing error: {str(e)}")
+        raise
 
 def process_video_simple_fallback(input_path, output_path):
     """Simple fallback processing for problematic videos."""
