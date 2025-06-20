@@ -1,0 +1,8 @@
+[phases.build]
+cmds = [
+    "apt-get update",
+    "apt-get install -y ffmpeg"
+]
+
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
