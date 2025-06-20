@@ -1,359 +1,318 @@
-from flask import Flask, request, send_file, jsonify
 import os
+import tempfile
 import uuid
-import subprocess
-import traceback
-import time
-import threading
-import logging
-import signal
 import psutil
-from datetime import datetime, timedelta
-from utils.ffmpeg_mods import build_ffmpeg_command
-
-app = Flask(__name__)
+import logging
+import threading
+import atexit
+import signal
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+from utils.ffmpeg_mods import process_video_comprehensive_stable, process_video_simple_fallback
+import subprocess
+import time
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+
 # Configuration
-UPLOAD_DIR = "/tmp/repostproof"
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-ALLOWED_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'}
-PROCESSING_TIMEOUT = 600  # 10 minutes for complex processing
-MAX_CONCURRENT_JOBS = 2  # Limit concurrent processing
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v'}
+MAX_CONCURRENT_JOBS = 2
+MEMORY_THRESHOLD = 800 * 1024 * 1024  # 800MB
+DISK_THRESHOLD = 1024 * 1024 * 1024   # 1GB
 
-# Global tracking
-active_jobs = 0
-active_processes = {}
-
-# Ensure upload directory exists
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Global job tracking
+active_jobs = {}
+job_lock = threading.Lock()
 
 def cleanup_old_files():
-    """Clean up files older than 1 hour"""
+    """Clean up old temporary files."""
     try:
-        cutoff_time = time.time() - 3600  # 1 hour ago
-        for filename in os.listdir(UPLOAD_DIR):
-            filepath = os.path.join(UPLOAD_DIR, filename)
-            if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
-                try:
-                    os.remove(filepath)
-                    logger.info(f"Cleaned up old file: {filename}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup {filename}: {e}")
+        temp_dir = Path(tempfile.gettempdir())
+        current_time = time.time()
+        
+        for file_path in temp_dir.glob("processed_*"):
+            try:
+                if current_time - file_path.stat().st_mtime > 1800:  # 30 minutes
+                    file_path.unlink()
+                    logger.info(f"Cleaned up old file: {file_path}")
+            except Exception as e:
+                logger.warning(f"Could not clean up {file_path}: {e}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
-def cleanup_worker():
-    """Background worker for file cleanup"""
-    while True:
-        try:
-            cleanup_old_files()
-            time.sleep(1800)  # Run every 30 minutes
-        except Exception as e:
-            logger.error(f"Cleanup worker error: {e}")
-            time.sleep(60)
+def cleanup_timer():
+    """Run cleanup every 30 minutes."""
+    cleanup_old_files()
+    timer = threading.Timer(1800, cleanup_timer)
+    timer.daemon = True
+    timer.start()
 
-# Start cleanup worker
-cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
-cleanup_thread.start()
-
-def kill_process_tree(pid):
-    """Kill a process and all its children"""
+def get_system_stats():
+    """Get current system resource usage."""
     try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            try:
-                child.kill()
-            except:
-                pass
-        try:
-            parent.kill()
-        except:
-            pass
-    except:
-        pass
-
-def validate_video_file(file):
-    """Validate uploaded file"""
-    if not file.filename:
-        return False, "No filename provided"
-    
-    # Check file extension
-    file_ext = os.path.splitext(file.filename.lower())[1]
-    if file_ext not in ALLOWED_EXTENSIONS:
-        return False, f"File type {file_ext} not supported. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-    
-    return True, "Valid"
-
-def get_memory_usage():
-    """Get current memory usage"""
-    try:
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 / 1024  # MB
-    except:
-        return 0
-
-@app.route("/health")
-def health_check():
-    """Health check endpoint"""
-    memory_mb = get_memory_usage()
-    disk_free = psutil.disk_usage(UPLOAD_DIR).free / 1024 / 1024 / 1024  # GB
-    
-    status = {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "memory_mb": round(memory_mb, 2),
-        "disk_free_gb": round(disk_free, 2),
-        "active_jobs": active_jobs,
-        "upload_dir": UPLOAD_DIR
-    }
-    
-    # Check if we're in a bad state
-    if memory_mb > 1000:  # > 1GB RAM usage
-        status["status"] = "warning"
-        status["warning"] = "High memory usage"
-    
-    if disk_free < 1:  # < 1GB free space
-        status["status"] = "warning" 
-        status["warning"] = "Low disk space"
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
         
-    if active_jobs >= MAX_CONCURRENT_JOBS:
-        status["status"] = "busy"
-        
-    return jsonify(status)
-
-@app.route("/repost-proof", methods=["POST"])
-def repost_proof():
-    global active_jobs
-    
-    # Check if we're overloaded
-    if active_jobs >= MAX_CONCURRENT_JOBS:
-        return jsonify({
-            "error": "Server busy", 
-            "message": "Too many concurrent requests. Try again later."
-        }), 503
-    
-    # Check memory before processing
-    memory_mb = get_memory_usage()
-    if memory_mb > 800:  # > 800MB
-        return jsonify({
-            "error": "Server overloaded",
-            "message": "High memory usage. Try again later."
-        }), 503
-    
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-    
-    video = request.files['file']
-    if video.filename == '':
-        return jsonify({"error": "No file selected"}), 400
-    
-    # Validate file
-    is_valid, message = validate_video_file(video)
-    if not is_valid:
-        return jsonify({"error": message}), 400
-    
-    # Generate unique filenames
-    file_id = str(uuid.uuid4())
-    filename = f"{file_id}.mp4"
-    input_path = os.path.join(UPLOAD_DIR, f"in_{filename}")
-    output_path = os.path.join(UPLOAD_DIR, f"out_{filename}")
-    
-    process = None
-    active_jobs += 1
-    
-    try:
-        logger.info(f"Starting processing job {file_id}")
-        
-        # Save uploaded file
-        video.save(input_path)
-        
-        # Check file size after saving
-        file_size = os.path.getsize(input_path)
-        if file_size > MAX_FILE_SIZE:
-            return jsonify({
-                "error": "File too large",
-                "max_size_mb": MAX_FILE_SIZE // (1024 * 1024)
-            }), 413
-        
-        logger.info(f"File saved: {input_path} ({file_size} bytes)")
-        
-        # Build FFmpeg command (simplified for stability)
-        ffmpeg_cmd, pitch_preserved = build_ffmpeg_command(input_path, output_path)
-        
-        logger.info(f"Running FFmpeg command for job {file_id}")
-        logger.debug(f"Command: {' '.join(ffmpeg_cmd)}")
-        
-        # Run FFmpeg with timeout and monitoring
-        start_time = time.time()
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            preexec_fn=os.setsid  # Create new process group
-        )
-        
-        active_processes[file_id] = process
-        
-        try:
-            stdout, stderr = process.communicate(timeout=PROCESSING_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"FFmpeg timeout for job {file_id}")
-            # Kill the entire process tree
-            kill_process_tree(process.pid)
-            process.kill()
-            process.wait()
-            raise RuntimeError("Processing timeout - video too complex or large")
-        
-        processing_time = time.time() - start_time
-        
-        if process.returncode != 0:
-            logger.error(f"FFmpeg failed for job {file_id}: {stderr}")
-            raise RuntimeError(f"Video processing failed: {stderr[:200]}...")
-        
-        # Check if output file was created
-        if not os.path.exists(output_path):
-            raise RuntimeError("Output file was not created")
-        
-        output_size = os.path.getsize(output_path)
-        if output_size == 0:
-            raise RuntimeError("Output file is empty")
-        
-        logger.info(f"Processing completed for job {file_id} in {processing_time:.2f}s")
-        
-        # Prepare response
-        file_too_large = output_size > 50 * 1024 * 1024  # 50MB
-        
-        result_json = {
-            "success": True,
-            "file_size_mb": round(output_size / (1024 * 1024), 2),
-            "processing_time_seconds": round(processing_time, 2),
-            "pitch_preserved": pitch_preserved,
-            "job_id": file_id
+        return {
+            'memory_used': memory.used,
+            'memory_percent': memory.percent,
+            'disk_used': disk.used,
+            'disk_free': disk.free,
+            'active_jobs': len(active_jobs)
         }
-        
-        if file_too_large:
-            # For large files, provide download link
-            public_link = f"{request.host_url}file-download/{os.path.basename(output_path)}"
-            result_json["url"] = public_link
-            result_json["message"] = "File too large for direct download, use provided URL"
-            return jsonify(result_json)
-        else:
-            # For small files, return directly
-            download_name = f"processed_{int(time.time())}.mp4"
-            return send_file(
-                output_path, 
-                as_attachment=True, 
-                download_name=download_name,
-                mimetype='video/mp4'
-            )
-            
-    except Exception as e:
-        logger.error(f"Processing error for job {file_id}: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        
-        error_message = str(e)
-        if "timeout" in error_message.lower():
-            error_code = 408
-        elif "memory" in error_message.lower():
-            error_code = 507
-        else:
-            error_code = 500
-            
-        return jsonify({
-            "error": "Processing failed",
-            "details": error_message[:200],  # Limit error message length
-            "job_id": file_id
-        }), error_code
-        
-    finally:
-        # Cleanup
-        active_jobs -= 1
-        
-        if file_id in active_processes:
-            del active_processes[file_id]
-        
-        # Always cleanup input file
-        try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-                logger.debug(f"Cleaned up input file: {input_path}")
-        except Exception as e:
-            logger.warning(f"Failed to cleanup input file {input_path}: {e}")
-        
-        # Cleanup output file after a delay (if it was served directly)
-        if 'output_path' in locals() and os.path.exists(output_path):
-            def delayed_cleanup():
-                time.sleep(300)  # Wait 5 minutes
-                try:
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                        logger.debug(f"Cleaned up output file: {output_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup output file {output_path}: {e}")
-            
-            threading.Thread(target=delayed_cleanup, daemon=True).start()
+    except Exception:
+        return {'memory_used': 0, 'memory_percent': 0, 'disk_used': 0, 'disk_free': 0, 'active_jobs': 0}
 
-@app.route("/file-download/<filename>")
-def download_file(filename):
-    """Download processed file"""
-    # Validate filename to prevent directory traversal
-    if '..' in filename or '/' in filename or '\\' in filename:
-        return jsonify({"error": "Invalid filename"}), 400
+def is_system_overloaded():
+    """Check if system is overloaded."""
+    stats = get_system_stats()
     
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    if stats['memory_used'] > MEMORY_THRESHOLD:
+        return True, "High memory usage"
     
-    if not os.path.exists(file_path):
-        return jsonify({"error": "File not found or expired"}), 404
+    if stats['disk_free'] < DISK_THRESHOLD:
+        return True, "Low disk space"
     
+    if stats['active_jobs'] >= MAX_CONCURRENT_JOBS:
+        return True, "Too many concurrent jobs"
+    
+    return False, None
+
+def allowed_file(filename):
+    """Check if file extension is allowed."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def kill_ffmpeg_processes():
+    """Kill any hanging FFmpeg processes."""
     try:
-        return send_file(
-            file_path, 
-            as_attachment=True, 
-            download_name=f"processed_{filename}",
-            mimetype='video/mp4'
-        )
+        for proc in psutil.process_iter(['pid', 'name', 'create_time']):
+            if proc.info['name'] == 'ffmpeg':
+                # Kill FFmpeg processes older than 10 minutes
+                if time.time() - proc.info['create_time'] > 600:
+                    proc.kill()
+                    logger.info(f"Killed hanging FFmpeg process: {proc.info['pid']}")
     except Exception as e:
-        logger.error(f"Download error for {filename}: {e}")
-        return jsonify({"error": "Download failed"}), 500
+        logger.error(f"Error killing FFmpeg processes: {e}")
 
-@app.route("/stats")
-def stats():
-    """Get server statistics"""
-    memory_mb = get_memory_usage()
-    disk_usage = psutil.disk_usage(UPLOAD_DIR)
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    stats = get_system_stats()
+    overloaded, reason = is_system_overloaded()
     
     return jsonify({
-        "active_jobs": active_jobs,
-        "memory_usage_mb": round(memory_mb, 2),
-        "disk_total_gb": round(disk_usage.total / 1024 / 1024 / 1024, 2),
-        "disk_free_gb": round(disk_usage.free / 1024 / 1024 / 1024, 2),
-        "disk_used_percent": round((disk_usage.used / disk_usage.total) * 100, 1),
-        "upload_dir_files": len(os.listdir(UPLOAD_DIR)) if os.path.exists(UPLOAD_DIR) else 0
+        'status': 'unhealthy' if overloaded else 'healthy',
+        'reason': reason,
+        'stats': stats
     })
 
-# Graceful shutdown handler
-def signal_handler(sig, frame):
-    logger.info("Shutting down gracefully...")
-    # Kill all active processes
-    for job_id, process in active_processes.items():
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Get system statistics."""
+    return jsonify(get_system_stats())
+
+@app.route('/process', methods=['POST'])
+def process_video():
+    """Process uploaded video."""
+    job_id = str(uuid.uuid4())
+    
+    try:
+        # System checks
+        overloaded, reason = is_system_overloaded()
+        if overloaded:
+            return jsonify({
+                'error': 'Service temporarily unavailable',
+                'details': reason,
+                'job_id': job_id
+            }), 503
+        
+        # File validation
+        if 'video' not in request.files:
+            return jsonify({
+                'error': 'No video file provided',
+                'job_id': job_id
+            }), 400
+        
+        file = request.files['video']
+        if file.filename == '':
+            return jsonify({
+                'error': 'No file selected',
+                'job_id': job_id
+            }), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({
+                'error': 'File type not supported',
+                'supported_types': list(ALLOWED_EXTENSIONS),
+                'job_id': job_id
+            }), 400
+        
+        # Check file size
+        file_content = file.read()
+        if len(file_content) > MAX_FILE_SIZE:
+            return jsonify({
+                'error': 'File too large',
+                'max_size_mb': MAX_FILE_SIZE // (1024 * 1024),
+                'job_id': job_id
+            }), 413
+        
+        # Create temporary files
+        input_filename = secure_filename(file.filename)
+        input_path = Path(tempfile.gettempdir()) / f"input_{job_id}_{input_filename}"
+        output_path = Path(tempfile.gettempdir()) / f"processed_{job_id}_{input_filename}"
+        
+        # Save input file
+        with open(input_path, 'wb') as f:
+            f.write(file_content)
+        
+        logger.info(f"Job {job_id}: Processing {input_filename} ({len(file_content)} bytes)")
+        
+        # Add to active jobs
+        with job_lock:
+            active_jobs[job_id] = {
+                'start_time': time.time(),
+                'input_file': input_filename,
+                'input_path': input_path,
+                'output_path': output_path
+            }
+        
         try:
-            kill_process_tree(process.pid)
-            logger.info(f"Killed process for job {job_id}")
-        except:
-            pass
-    exit(0)
+            # Try comprehensive processing first
+            logger.info(f"Job {job_id}: Starting comprehensive processing")
+            success = process_video_comprehensive_stable(input_path, output_path)
+            
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Comprehensive processing failed: {str(e)}")
+            
+            # Check for specific type error
+            if "expected str instance" in str(e) or "sequence item" in str(e):
+                logger.info(f"Job {job_id}: Type error detected, using fallback")
+                success = process_video_simple_fallback(input_path, output_path)
+            else:
+                # Try fallback processing
+                logger.info(f"Job {job_id}: Trying fallback processing")
+                success = process_video_simple_fallback(input_path, output_path)
+        
+        # Check if output file was created
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise Exception("Output file was not created or is empty")
+        
+        # Cleanup input file
+        try:
+            input_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not delete input file: {e}")
+        
+        # Remove from active jobs
+        with job_lock:
+            if job_id in active_jobs:
+                processing_time = time.time() - active_jobs[job_id]['start_time']
+                del active_jobs[job_id]
+                logger.info(f"Job {job_id}: Completed in {processing_time:.1f}s")
+        
+        # Schedule output file cleanup
+        def cleanup_output():
+            time.sleep(300)  # 5 minutes
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+                    logger.info(f"Cleaned up output file: {output_path}")
+            except Exception as e:
+                logger.warning(f"Could not clean up output file: {e}")
+        
+        cleanup_thread = threading.Thread(target=cleanup_output)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        
+        # Return processed file
+        return send_file(
+            str(output_path),
+            as_attachment=True,
+            download_name=f"processed_{input_filename}",
+            mimetype='video/mp4'
+        )
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Job {job_id}: Processing failed: {error_msg}")
+        
+        # Cleanup on error
+        with job_lock:
+            if job_id in active_jobs:
+                job_info = active_jobs[job_id]
+                try:
+                    if job_info['input_path'].exists():
+                        job_info['input_path'].unlink()
+                except Exception:
+                    pass
+                try:
+                    if job_info['output_path'].exists():
+                        job_info['output_path'].unlink()
+                except Exception:
+                    pass
+                del active_jobs[job_id]
+        
+        # Return appropriate error response
+        if "timed out" in error_msg.lower():
+            return jsonify({
+                'error': 'Processing timeout',
+                'details': 'Video processing took too long',
+                'job_id': job_id
+            }), 408
+        elif "memory" in error_msg.lower() or "space" in error_msg.lower():
+            return jsonify({
+                'error': 'Resource limitation',
+                'details': 'Insufficient system resources',
+                'job_id': job_id
+            }), 507
+        elif "expected str instance" in error_msg or "sequence item" in error_msg:
+            return jsonify({
+                'error': 'Processing failed',
+                'details': 'Internal processing error - please try again',
+                'job_id': job_id
+            }), 500
+        else:
+            return jsonify({
+                'error': 'Processing failed',
+                'details': 'Video processing failed',
+                'job_id': job_id
+            }), 500
 
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
+@app.route('/', methods=['GET'])
+def index():
+    """Basic info endpoint."""
+    return jsonify({
+        'service': 'Video Processing Service',
+        'status': 'running',
+        'endpoints': {
+            'POST /process': 'Upload and process video',
+            'GET /health': 'Health check',
+            'GET /stats': 'System statistics'
+        }
+    })
 
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)
+def cleanup_on_exit():
+    """Cleanup function called on exit."""
+    logger.info("Shutting down, cleaning up...")
+    kill_ffmpeg_processes()
+    cleanup_old_files()
+
+# Register cleanup function
+atexit.register(cleanup_on_exit)
+signal.signal(signal.SIGTERM, lambda signum, frame: exit(0))
+
+# Start cleanup timer
+cleanup_timer()
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
