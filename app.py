@@ -25,9 +25,9 @@ app = Flask(__name__)
 # Configuration
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v'}
-MAX_CONCURRENT_JOBS = 2
-MEMORY_THRESHOLD = 800 * 1024 * 1024  # 800MB
-DISK_THRESHOLD = 1024 * 1024 * 1024   # 1GB
+MAX_CONCURRENT_JOBS = 3
+MEMORY_THRESHOLD = 1500 * 1024 * 1024  # 1.5GB (increased for Railway)
+DISK_THRESHOLD = 500 * 1024 * 1024   # 500MB (reduced threshold)
 
 # Global job tracking
 active_jobs = {}
@@ -65,27 +65,53 @@ def get_system_stats():
         return {
             'memory_used': memory.used,
             'memory_percent': memory.percent,
+            'memory_available': memory.available,
             'disk_used': disk.used,
             'disk_free': disk.free,
+            'disk_percent': (disk.used / disk.total) * 100,
             'active_jobs': len(active_jobs)
         }
-    except Exception:
-        return {'memory_used': 0, 'memory_percent': 0, 'disk_used': 0, 'disk_free': 0, 'active_jobs': 0}
+    except Exception as e:
+        logger.warning(f"Could not get system stats: {e}")
+        return {
+            'memory_used': 0, 
+            'memory_percent': 0, 
+            'memory_available': 1024*1024*1024,  # 1GB default
+            'disk_used': 0, 
+            'disk_free': 2*1024*1024*1024,  # 2GB default
+            'disk_percent': 0,
+            'active_jobs': len(active_jobs)
+        }
 
 def is_system_overloaded():
     """Check if system is overloaded."""
-    stats = get_system_stats()
+    try:
+        stats = get_system_stats()
+        
+        # More lenient memory check
+        if stats['memory_percent'] > 85:  # Use percentage instead of absolute
+            return True, "High memory usage"
+        
+        if stats['disk_free'] < DISK_THRESHOLD:
+            return True, "Low disk space"
+        
+        if stats['active_jobs'] >= MAX_CONCURRENT_JOBS:
+            return True, "Too many concurrent jobs"
+        
+        # Add CPU check if available
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            if cpu_percent > 90:
+                return True, "High CPU usage"
+        except:
+            pass
+        
+        return False, None
     
-    if stats['memory_used'] > MEMORY_THRESHOLD:
-        return True, "High memory usage"
-    
-    if stats['disk_free'] < DISK_THRESHOLD:
-        return True, "Low disk space"
-    
-    if stats['active_jobs'] >= MAX_CONCURRENT_JOBS:
-        return True, "Too many concurrent jobs"
-    
-    return False, None
+    except Exception as e:
+        logger.warning(f"Could not check system load: {e}")
+        # If we can't check, allow processing
+        return False, None
 
 def allowed_file(filename):
     """Check if file extension is allowed."""
